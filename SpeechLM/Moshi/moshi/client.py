@@ -15,7 +15,7 @@ import sounddevice as sd
 
 from .client_utils import AnyPrinter, Printer, RawPrinter
 
-
+# 管理 WebSocket 连接、音频输入输出流以及 Opus 编解码
 class Connection:
     def __init__(
         self,
@@ -49,6 +49,7 @@ class Connection:
         self._opus_reader = sphn.OpusStreamReader(sample_rate)
         self._output_queue = queue.Queue()
 
+    # 将本地麦克风录制的音频数据发送到服务器
     async def _queue_loop(self) -> None:
         while True:
             if self._done:
@@ -57,12 +58,14 @@ class Connection:
             msg = self._opus_writer.read_bytes()
             if len(msg) > 0:
                 try:
+                    # 异步发送数据，数据前缀为 \x01，表示这是一个音频帧
                     await self.websocket.send_bytes(b"\x01" + msg)
                 except Exception as e:
                     print(e)
                     self._lost_connection()
                     return
 
+    # 从服务器接收音频数据并解码为 PCM 格式
     async def _decoder_loop(self) -> None:
         all_pcm_data = None
         while True:
@@ -74,6 +77,7 @@ class Connection:
                 all_pcm_data = pcm
             else:
                 all_pcm_data = np.concatenate((all_pcm_data, pcm))
+            # 当累积的 PCM 数据长度达到或超过 frame_size 时，将一帧数据放入输出队列
             while all_pcm_data.shape[-1] >= self.frame_size:
                 self._output_queue.put(all_pcm_data[: self.frame_size])
                 all_pcm_data = np.array(all_pcm_data[self.frame_size :])
@@ -140,7 +144,7 @@ class Connection:
                 self._recv_loop(), self._decoder_loop(), self._queue_loop()
             )
 
-
+# 根据命令行参数构建 WebSocket URI，并与服务器建立连接
 async def run(printer: AnyPrinter, args):
     if args.url is None:
         proto = "ws"

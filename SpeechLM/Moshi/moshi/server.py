@@ -93,37 +93,44 @@ class ServerState:
         ws = web.WebSocketResponse()
         # 准备 WebSocket 连接
         await ws.prepare(request)
-
         # 接收循环，负责接收客户端发送的 WebSocket 消息
         async def recv_loop():
+            # 使用 nonlocal 关键字声明 close 变量，使其可以在嵌套函数中修改外部作用域中的变量
             nonlocal close
             try:
                 async for message in ws:
+                    # 如果消息类型为 ERROR，记录错误日志并中断循环
                     if message.type == aiohttp.WSMsgType.ERROR:
                         log("error", f"{ws.exception()}")
                         break
+                    # 如果消息类型为 CLOSED，直接中断循环
                     elif message.type == aiohttp.WSMsgType.CLOSED:
                         break
+                    # 如果消息类型不是 BINARY，记录警告日志并继续循环
                     elif message.type != aiohttp.WSMsgType.BINARY:
                         log("error", f"unexpected message type {message.type}")
                         continue
+
                     message = message.data
+                    # 检查消息数据是否为字节类型，如果不是则记录错误日志并跳过
                     if not isinstance(message, bytes):
                         log("error", f"unsupported message type {type(message)}")
                         continue
+                    # 检查消息长度是否为零，如果是则记录警告日志并跳过
                     if len(message) == 0:
                         log("warning", "empty message")
                         continue
                     kind = message[0]
                     if kind == 1:  # audio
+                        # 如果种类为 1（音频），将剩余数据传递给 opus_reader 处理
                         payload = message[1:]
                         opus_reader.append_bytes(payload)
+                    # 否则，记录未知消息类型的警告日志
                     else:
                         log("warning", f"unknown message kind {kind}")
             finally:
                 close = True
                 log("info", "connection closed")
-
         # Opus 循环，负责处理接收到的音频数据，进行编码、解码和文本生成
         async def opus_loop():
             all_pcm_data = None
@@ -131,29 +138,41 @@ class ServerState:
             while True:
                 if close:
                     return
+                # 每次循环时休眠 1 毫秒，避免 CPU 占用过高？
                 await asyncio.sleep(0.001)
+                # 从 opus_reader？ 中读取 PCM 数据
                 pcm = opus_reader.read_pcm()
+                # 如果读取到的数据为空，则跳过本次循环
                 if pcm.shape[-1] == 0:
                     continue
+                # 将新读取的 PCM 数据与之前累积的数据拼接在一起
                 if all_pcm_data is None:
                     all_pcm_data = pcm
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
+                # 当累积的 PCM 数据长度达到或超过 frame_size 时，开始处理帧数据
                 while all_pcm_data.shape[-1] >= self.frame_size:
                     be = time.time()
+                    # 提取前 frame_size 长度的数据作为一帧
                     chunk = all_pcm_data[: self.frame_size]
+                    # 剩余数据作为下一帧数据
                     all_pcm_data = all_pcm_data[self.frame_size :]
+                    # 将 NumPy 数组转换为 PyTorch 张量，并添加 batch 和 channel 维度
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
+                    # 使用 mimi 模型对帧数据进行编码，生成编码后的表示 codes
                     codes = self.mimi.encode(chunk)
                     for c in range(codes.shape[-1]):
+                        # 使用语言模型生成新的 Token。如果生成失败（返回 None），则跳过当前编码结果
                         tokens = self.lm_gen.step(codes[:, :, c : c + 1])
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+                        # 使用 mimi 模型解码生成的 Token，得到 PCM 数据，并将其写入 opus_writer
                         main_pcm = self.mimi.decode(tokens[:, 1:])
                         main_pcm = main_pcm.cpu()
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
+                        # 如果生成的文本 Token 不是特殊标记（如 0 或 3），则将其转换为可读文本，并通过 WebSocket 发送给客户端
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
